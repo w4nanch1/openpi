@@ -20,14 +20,14 @@ from openpi.training import data_loader as _data
 @dataclasses.dataclass
 class Args:
     # 需要提取激活的两组权重路径
-    finetuned_ckpt_dir: str = "/root/openpi_ref/checkpoints/pi05_libero_base"
-    base_ckpt_dir: str = "/root/openpi_ref/checkpoints/pi05_base"
+    finetuned_ckpt_dir: str = "/root/openpi/checkpoints/pi05_libero_base"
+    base_ckpt_dir: str = "/root/openpi/checkpoints/pi05_base"
 
     # 使用的训练配置
     config_name: str = "pi05_libero"
 
     # 输出目录
-    output_dir: str = "/root/openpi_ref/libero_compare/"
+    output_dir: str = "/root/openpi/libero_compare/"
 
     # 选择要抓取的层号（0-based，作用于 action expert Transformer）
     activation_layers: list[int] = dataclasses.field(default_factory=lambda: [9])
@@ -50,7 +50,7 @@ class Args:
     # 额外选项
     seed: int = 0
     num_workers: int = 0
-    assets_base_dir: str = "/root/.cache/openpi/openpi-assets/checkpoints"
+    assets_base_dir: str = "/root/openpi/assets"
 
 
 def _setup_logging():
