@@ -243,7 +243,54 @@ class BaseModelConfig(abc.ABC):
     def load_pytorch(self, train_config, weight_path: str):
         logger.info(f"train_config: {train_config}")
         model = pi0_pytorch.PI0Pytorch(config=train_config.model)
-        safetensors.torch.load_model(model, weight_path)
+        
+        # Load the state dict from safetensors file
+        from safetensors import safe_open
+        state_dict = {}
+        with safe_open(weight_path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                state_dict[key] = f.get_tensor(key)
+        
+        # Remove "model." prefix from keys if present (for HuggingFace format)
+        model_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith("model."):
+                new_key = key[6:]  # Remove "model." prefix (6 characters)
+                model_state_dict[new_key] = value
+            else:
+                model_state_dict[key] = value
+        
+        # Handle weight tying: if embed_tokens.weight is missing but lm_head.weight exists,
+        # use lm_head.weight for embed_tokens.weight (common in language models)
+        embed_tokens_key = "paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"
+        lm_head_key = "paligemma_with_expert.paligemma.lm_head.weight"
+        
+        if embed_tokens_key not in model_state_dict and lm_head_key in model_state_dict:
+            logger.info(f"Using weight tying: copying {lm_head_key} to {embed_tokens_key}")
+            model_state_dict[embed_tokens_key] = model_state_dict[lm_head_key]
+        
+        # Load the state dict into the model
+        missing, unexpected = model.load_state_dict(model_state_dict, strict=False)
+        if missing:
+            missing_list = sorted(list(missing))
+            logger.warning(f"Missing keys in checkpoint: {len(missing)} keys")
+            logger.warning(f"Sample missing keys (first 20): {missing_list[:20]}")
+        if unexpected:
+            unexpected_list = sorted(list(unexpected))
+            logger.warning(f"Unexpected keys in checkpoint: {len(unexpected)} keys")
+            logger.warning(f"Sample unexpected keys (first 20): {unexpected_list[:20]}")
+        
+        # Set up weight tying: tie lm_head.weight with embed_tokens.weight
+        # This ensures they share the same memory during inference
+        if hasattr(model.paligemma_with_expert.paligemma, "lm_head") and hasattr(
+            model.paligemma_with_expert.paligemma.model.language_model, "embed_tokens"
+        ):
+            lm_head = model.paligemma_with_expert.paligemma.lm_head
+            embed_tokens = model.paligemma_with_expert.paligemma.model.language_model.embed_tokens
+            if lm_head.weight.shape == embed_tokens.weight.shape:
+                logger.info("Setting up weight tying: lm_head.weight <-> embed_tokens.weight")
+                embed_tokens.weight = lm_head.weight
+        
         return model
 
     @abc.abstractmethod

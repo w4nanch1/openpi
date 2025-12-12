@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Literal, Callable
 
 import pytest
 import torch
@@ -58,6 +58,11 @@ class PaliGemmaWithExpertModel(nn.Module):
         self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
         self.gemma_expert.model.embed_tokens = None
 
+        # Hook mechanism for capturing activations
+        self.activation_hooks: dict[int, Callable] = {}  # layer_idx -> hook function
+        self.captured_activations: dict[int, list[torch.Tensor]] = {}  # layer_idx -> list of activations
+        self._registered_pytorch_hooks: list = []  # Store PyTorch hooks for cleanup
+
         self.to_bfloat16_for_selected_params(precision)
 
     def to_bfloat16_for_selected_params(self, precision: Literal["bfloat16", "float32"] = "bfloat16"):
@@ -87,6 +92,61 @@ class PaliGemmaWithExpertModel(nn.Module):
 
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.paligemma.language_model.embed_tokens(tokens)
+
+    def register_activation_hook(self, layer_idx: int, hook_fn: Callable[[torch.Tensor], None]):
+        """Register a hook function to capture activations at a specific layer.
+        
+        Args:
+            layer_idx: The layer index (0-based) to capture activations from
+            hook_fn: A function that takes a tensor (activation) and processes it
+        """
+        self.activation_hooks[layer_idx] = hook_fn
+        if layer_idx not in self.captured_activations:
+            self.captured_activations[layer_idx] = []
+
+        # Also register PyTorch forward hook for standalone gemma_expert calls
+        if layer_idx < len(self.gemma_expert.model.layers):
+            def make_pytorch_hook(layer_idx, hook_fn):
+                def pytorch_hook(module, input, output):
+                    # output is a tuple (hidden_states, ...) or just hidden_states
+                    if isinstance(output, tuple):
+                        hidden_states = output[0]
+                    else:
+                        hidden_states = output
+                    # Capture the last token's activation
+                    if hidden_states.dim() == 3:  # [batch_size, seq_len, hidden_size]
+                        last_token_activation = hidden_states[:, -1, :].detach().clone()
+                        hook_fn(last_token_activation)
+                return pytorch_hook
+
+            hook_handle = self.gemma_expert.model.layers[layer_idx].register_forward_hook(
+                make_pytorch_hook(layer_idx, hook_fn)
+            )
+            self._registered_pytorch_hooks.append(hook_handle)
+
+    def clear_activation_hooks(self):
+        """Clear all registered activation hooks."""
+        # Remove PyTorch hooks
+        for hook_handle in self._registered_pytorch_hooks:
+            hook_handle.remove()
+        self._registered_pytorch_hooks.clear()
+        
+        self.activation_hooks.clear()
+        self.captured_activations.clear()
+
+    def get_captured_activations(self, layer_idx: int | None = None) -> dict[int, list[torch.Tensor]] | list[torch.Tensor]:
+        """Get captured activations.
+        
+        Args:
+            layer_idx: If provided, returns activations for that layer only.
+                      If None, returns all captured activations.
+        
+        Returns:
+            Dictionary of layer_idx -> list of activations, or list if layer_idx is specified
+        """
+        if layer_idx is not None:
+            return self.captured_activations.get(layer_idx, [])
+        return self.captured_activations.copy()
 
     def forward(
         self,
@@ -232,6 +292,14 @@ class PaliGemmaWithExpertModel(nn.Module):
                     out_emb = layer.mlp(out_emb)
                     # second residual
                     out_emb = modeling_gemma._gated_residual(after_first_residual, out_emb, gate)  # noqa: SLF001
+                    
+                    # Capture activation for action expert (i=1) if hook is registered
+                    if i == 1 and layer_idx in self.activation_hooks:
+                        # Capture the last token's activation (for visualization)
+                        # out_emb shape: [batch_size, seq_len, hidden_size]
+                        last_token_activation = out_emb[:, -1, :].detach().clone()  # [batch_size, hidden_size]
+                        self.activation_hooks[layer_idx](last_token_activation)
+                    
                     outputs_embeds.append(out_emb)
                     start_pos = end_pos
 

@@ -1,6 +1,10 @@
 import logging
 import math
+import pickle
+import pathlib
+from collections import defaultdict
 
+import numpy as np
 import torch
 from torch import Tensor
 from torch import nn
@@ -114,6 +118,11 @@ class PI0Pytorch(nn.Module):
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
+        # Activation capture settings
+        self.capture_activations = False
+        self.activation_layers: list[int] = []  # List of layer indices to capture
+        self.current_step_activations: dict[int, list[torch.Tensor]] = defaultdict(list)  # Current inference step activations
+
         msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
         try:
             from transformers.models.siglip import check
@@ -144,6 +153,70 @@ class PI0Pytorch(nn.Module):
     def is_gradient_checkpointing_enabled(self):
         """Check if gradient checkpointing is enabled."""
         return self.gradient_checkpointing_enabled
+
+    def enable_activation_capture(self, layer_indices: list[int]):
+        """Enable activation capture for specified layers.
+        
+        Args:
+            layer_indices: List of layer indices (0-based) to capture activations from.
+                          For example, [8, 9] to capture layers 9 and 10 (0-indexed).
+        """
+        self.capture_activations = True
+        self.activation_layers = layer_indices
+        self.current_step_activations.clear()
+
+        # Register hooks for each specified layer
+        for layer_idx in layer_indices:
+            def make_hook(layer_idx):
+                def hook_fn(activation: torch.Tensor):
+                    # Store activation on GPU first (avoid device switch in compiled path)
+                    # We'll convert to CPU when retrieving
+                    activation_detached = activation.detach().clone()
+                    self.current_step_activations[layer_idx].append(activation_detached)
+                return hook_fn
+
+            self.paligemma_with_expert.register_activation_hook(layer_idx, make_hook(layer_idx))
+
+        logging.info(f"Enabled activation capture for layers: {layer_indices}")
+
+    def disable_activation_capture(self):
+        """Disable activation capture and clear hooks."""
+        self.capture_activations = False
+        self.paligemma_with_expert.clear_activation_hooks()
+        self.current_step_activations.clear()
+        logging.info("Disabled activation capture")
+
+    def get_current_step_activations(self) -> dict[int, np.ndarray] | None:
+        """Get activations from the current inference step and clear them.
+        
+        Returns:
+            Dictionary of layer_idx -> numpy array of activations, or None if no activations captured.
+            Each array has shape [num_tokens, hidden_size] where num_tokens is the number of denoising steps.
+        """
+        # logging.info(f"get_current_step_activations called. capture_activations: {self.capture_activations}")
+        # logging.info(f"current_step_activations keys: {list(self.current_step_activations.keys())}")
+        # logging.info(f"current_step_activations lengths: {[(k, len(v)) for k, v in self.current_step_activations.items()]}")
+        
+        if not self.capture_activations:
+            logging.warning("capture_activations is False")
+            return None
+        
+        if not self.current_step_activations:
+            logging.warning("current_step_activations is empty")
+            return None
+
+        activations_dict = {}
+        for layer_idx, activations in self.current_step_activations.items():
+            if activations:
+                # Stack activations: [num_tokens, hidden_size]
+                stacked = torch.stack(activations, dim=0)
+                # Convert to CPU and float32, then to numpy
+                activations_dict[layer_idx] = stacked.cpu().to(torch.float32).numpy()
+
+        # Clear for next step
+        self.current_step_activations.clear()
+
+        return activations_dict
 
     def _apply_checkpoint(self, func, *args, **kwargs):
         """Helper method to apply gradient checkpointing if enabled."""

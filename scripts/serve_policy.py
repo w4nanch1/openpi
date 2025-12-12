@@ -54,6 +54,12 @@ class Args:
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
+    # Activation capture settings
+    # Enable activation capture for action expert layers
+    capture_activations: bool = False
+    # Layer indices to capture (0-based, comma-separated, e.g., "8,9" for layers 9 and 10)
+    activation_layers: str = "9"
+
 
 # Default checkpoints that should be used for each environment.
 DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
@@ -100,6 +106,25 @@ def main(args: Args) -> None:
     policy = create_policy(args)
     policy_metadata = policy.metadata
 
+    # Enable activation capture if requested (before wrapping with PolicyRecorder)
+    actual_policy = policy
+    if args.capture_activations:
+        # Access the model through the private _model attribute
+        model = actual_policy._model if hasattr(actual_policy, "_model") else None
+        if model is not None and hasattr(model, "enable_activation_capture"):
+            # Parse layer indices from comma-separated string
+            try:
+                layer_indices = [int(x.strip()) for x in args.activation_layers.split(",")]
+            except ValueError:
+                logging.error(f"Invalid activation_layers format: {args.activation_layers}. Expected comma-separated integers.")
+                layer_indices = [9]  # Default fallback
+            
+            model.enable_activation_capture(layer_indices=layer_indices)
+            logging.info(f"Activation capture enabled for layers: {layer_indices}")
+            logging.info("Activations will be returned in policy inference outputs")
+        else:
+            logging.warning("Model does not support activation capture. Ignoring capture_activations flag.")
+
     # Record the policy's behavior.
     if args.record:
         policy = _policy.PolicyRecorder(policy, "policy_records")
@@ -114,7 +139,11 @@ def main(args: Args) -> None:
         port=args.port,
         metadata=policy_metadata,
     )
-    server.serve_forever()
+    
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logging.info("Server interrupted by user")
 
 
 if __name__ == "__main__":

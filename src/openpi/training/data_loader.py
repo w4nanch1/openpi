@@ -241,7 +241,6 @@ def create_data_loader(
     """
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
-
     if data_config.rlds_data_dir is not None:
         return create_rlds_data_loader(
             data_config,

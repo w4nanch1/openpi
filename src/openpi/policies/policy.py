@@ -94,12 +94,28 @@ class Policy(BasePolicy):
             "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
         }
         model_time = time.monotonic() - start_time
+        
+        # Get activations if capture is enabled (for PyTorch models) - BEFORE transforms
+        activations_to_add = None
         if self._is_pytorch_model:
-            outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
+            if hasattr(self._model, "get_current_step_activations"):
+                activations = self._model.get_current_step_activations()
+                if activations is not None:
+                    # Convert integer keys to strings for compatibility with flatten_dict
+                    activations_str_keys = {str(k): v for k, v in activations.items()}
+                    activations_to_add = activations_str_keys
+        
+        if self._is_pytorch_model:
+            outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()) if isinstance(x, torch.Tensor) else x, outputs)
         else:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
         outputs = self._output_transform(outputs)
+        
+        # Add activations AFTER transforms to avoid being filtered out
+        if activations_to_add is not None:
+            outputs["activations"] = activations_to_add
+        
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
