@@ -13,6 +13,7 @@ import torch.nn.functional as F  # noqa: N812
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
+from openpi.models_pytorch.steering_methods import create_activation_processor
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -90,6 +91,9 @@ class PI0Pytorch(nn.Module):
         super().__init__()
         self.config = config
         self.pi05 = config.pi05
+        
+        # Create activation processor from config
+        self.activation_processor = create_activation_processor(config.steering_config)
 
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
@@ -98,7 +102,7 @@ class PI0Pytorch(nn.Module):
             paligemma_config,
             action_expert_config,
             use_adarms=[False, True] if self.pi05 else [False, False],
-            precision=config.dtype,
+            precision=config.dtype
         )
 
         self.action_in_proj = nn.Linear(32, action_expert_config.width)
@@ -169,10 +173,10 @@ class PI0Pytorch(nn.Module):
         for layer_idx in layer_indices:
             def make_hook(layer_idx):
                 def hook_fn(activation: torch.Tensor):
-                    # Store activation on GPU first (avoid device switch in compiled path)
-                    # We'll convert to CPU when retrieving
                     activation_detached = activation.detach().clone()
                     self.current_step_activations[layer_idx].append(activation_detached)
+                    if self.activation_processor:
+                        self.activation_processor.steer_activation(layer_idx, activation_detached)
                 return hook_fn
 
             self.paligemma_with_expert.register_activation_hook(layer_idx, make_hook(layer_idx))
@@ -191,11 +195,12 @@ class PI0Pytorch(nn.Module):
         
         Returns:
             Dictionary of layer_idx -> numpy array of activations, or None if no activations captured.
-            Each array has shape [num_tokens, hidden_size] where num_tokens is the number of denoising steps.
+            Each array has shape [num_tokens, batch, seq_len, hidden_size] (batch usually 1),
+            where num_tokens is the number of denoising steps collected.
         """
-        # logging.info(f"get_current_step_activations called. capture_activations: {self.capture_activations}")
-        # logging.info(f"current_step_activations keys: {list(self.current_step_activations.keys())}")
-        # logging.info(f"current_step_activations lengths: {[(k, len(v)) for k, v in self.current_step_activations.items()]}")
+        logging.info(f"get_current_step_activations called. capture_activations: {self.capture_activations}")
+        logging.info(f"current_step_activations keys: {list(self.current_step_activations.keys())}")
+        logging.info(f"current_step_activations lengths: {[(k, len(v)) for k, v in self.current_step_activations.items()]}")
         
         if not self.capture_activations:
             logging.warning("capture_activations is False")
@@ -208,7 +213,7 @@ class PI0Pytorch(nn.Module):
         activations_dict = {}
         for layer_idx, activations in self.current_step_activations.items():
             if activations:
-                # Stack activations: [num_tokens, hidden_size]
+                # Stack activations: [num_tokens, batch, seq_len, hidden_size]
                 stacked = torch.stack(activations, dim=0)
                 # Convert to CPU and float32, then to numpy
                 activations_dict[layer_idx] = stacked.cpu().to(torch.float32).numpy()

@@ -3,6 +3,8 @@
 checkpoints/
 data/
 wandb/
+libero_compare/
+libero_compare_last_token/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

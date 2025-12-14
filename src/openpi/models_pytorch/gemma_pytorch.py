@@ -7,6 +7,7 @@ from transformers import GemmaForCausalLM
 from transformers import PaliGemmaForConditionalGeneration
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
+from openpi.models_pytorch.steering_methods.base import ActivationProcessor
 
 
 class PaliGemmaWithExpertModel(nn.Module):
@@ -113,10 +114,10 @@ class PaliGemmaWithExpertModel(nn.Module):
                         hidden_states = output[0]
                     else:
                         hidden_states = output
-                    # Capture the last token's activation
+                    # Capture all tokens' activations (e.g., all action tokens downstream)
                     if hidden_states.dim() == 3:  # [batch_size, seq_len, hidden_size]
-                        last_token_activation = hidden_states[:, -1, :].detach().clone()
-                        hook_fn(last_token_activation)
+                        activation_detached = hidden_states.detach().clone()
+                        hook_fn(activation_detached)
                 return pytorch_hook
 
             hook_handle = self.gemma_expert.model.layers[layer_idx].register_forward_hook(
@@ -295,10 +296,10 @@ class PaliGemmaWithExpertModel(nn.Module):
                     
                     # Capture activation for action expert (i=1) if hook is registered
                     if i == 1 and layer_idx in self.activation_hooks:
-                        # Capture the last token's activation (for visualization)
+                        # Capture all tokens' activations (keep full sequence)
                         # out_emb shape: [batch_size, seq_len, hidden_size]
-                        last_token_activation = out_emb[:, -1, :].detach().clone()  # [batch_size, hidden_size]
-                        self.activation_hooks[layer_idx](last_token_activation)
+                        activation_detached = out_emb.detach().clone()
+                        self.activation_hooks[layer_idx](activation_detached)
                     
                     outputs_embeds.append(out_emb)
                     start_pos = end_pos

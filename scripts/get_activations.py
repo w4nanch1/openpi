@@ -29,7 +29,7 @@ class Args:
     # 输出目录
     output_dir: str = "/root/openpi/libero_compare/"
 
-    # 选择要抓取的层号（0-based，作用于 action expert Transformer）
+    # 选择要抓取的层号
     activation_layers: list[int] = dataclasses.field(default_factory=lambda: [9])
 
     # 总共的 batch 数量
@@ -38,7 +38,7 @@ class Args:
     # 每多少个样本聚合保存一次
     save_group_size: int = 100
 
-    # batch 大小（建议 1，避免激活混到一起）
+    # batch 大小
     batch_size: int = 1
 
     # 是否跳过 norm stats（若本地没有 norm_stats.json，则设为 True）
@@ -51,6 +51,10 @@ class Args:
     seed: int = 0
     num_workers: int = 0
     assets_base_dir: str = "/root/openpi/assets"
+    
+    # Steering 配置
+    steering_method: str = "none" 
+    steering_params: dict = dataclasses.field(default_factory=dict) 
 
 
 def _setup_logging():
@@ -71,6 +75,22 @@ def _prepare_config(args: Args) -> _config.TrainConfig:
     )
     if args.assets_base_dir is not None:
         cfg = dataclasses.replace(cfg, assets_base_dir=args.assets_base_dir)
+    
+    if args.steering_method != "none":
+        steering_config = {
+            "method": args.steering_method,
+            "params": args.steering_params,
+        }
+        cfg = dataclasses.replace(
+            cfg,
+            model=dataclasses.replace(cfg.model, steering_config=steering_config),
+        )
+    else:
+        cfg = dataclasses.replace(
+            cfg,
+            model=dataclasses.replace(cfg.model, steering_config=None),
+        )
+    
     return cfg
 
 
@@ -130,11 +150,9 @@ def main(args: Args):
     device = torch.device(args.device)
 
     cfg = _prepare_config(args)
-    logging.info("使用配置: %s", cfg.name)
 
     loader = _create_loader(cfg, args)
     data_cfg = loader.data_config()
-    logging.info("数据配置: %s", data_cfg)
 
     output_dir = pathlib.Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -149,18 +167,16 @@ def main(args: Args):
         cfg.model.action_dim,
     )
 
-    # 缓存每个模型的激活，凑满 save_group_size 再落盘
     buffers: dict[str, list[dict[str, object]]] = {"finetuned": [], "base": []}
     group_start: dict[str, int] = {"finetuned": 0, "base": 0}
 
-    for batch_idx, (observation, actions) in enumerate(tqdm(loader, total=args.num_batches, desc="提取激活")):
+    for batch_idx, (observation, actions) in enumerate(tqdm(loader, total=args.num_batches, desc="extract activations")):
         obs_on_device = _observation_to_device(observation, device)
         expert_actions = actions.cpu().numpy()
         prompt_tokens = (
             observation.tokenized_prompt.cpu().numpy() if observation.tokenized_prompt is not None else None
         )
 
-        # 为两组模型共用同一份噪声，便于对比
         shared_noise = torch.randn(action_shape, device=device, dtype=torch.float32)
 
         for tag, model in models.items():
@@ -177,7 +193,6 @@ def main(args: Args):
                 }
             )
 
-            # 达到 group size 就写盘
             if len(buffers[tag]) >= args.save_group_size:
                 start_idx = group_start[tag]
                 end_idx = batch_idx
@@ -185,18 +200,15 @@ def main(args: Args):
                 buffers[tag].clear()
                 group_start[tag] = batch_idx + 1
 
-        # 释放显存
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # 刷新残余
     for tag, buf in buffers.items():
         if buf:
             start_idx = group_start[tag]
             end_idx = buf[-1]["batch_idx"]
             _save_activations(output_dir, tag, start_idx, end_idx, buf)
 
-    logging.info("全部完成，激活保存在: %s", output_dir)
 
 
 if __name__ == "__main__":
